@@ -1,0 +1,8 @@
+{
+  "id": "sparkworks-enhanced",
+  "name": "Sparkworks Enhanced",
+  "version": "1.0.0",
+  "description": "Adds the category \"Sparkworks Enhanced\" to the Sparkworks editor with five logic nodes: \"Counter\" counts signals and passes one on from a chosen count until its reset input gets a signal; \"Time\" is on at night, during the day or in a chosen time span (combine it with AND); \"Random\" rolls a chance whenever a signal comes in; \"Random Timer\" passes a signal on after a random delay or switches on and off at random intervals; \"Message\" shows a center-screen message (door opened, alarm raised, alarm resolved) to the players near the objects wired to it. Trigger areas named like \"Entrance (2)\" need at least that many entities inside, \"(=2)\" exactly, \"(<2)\" at least one but fewer, \"(>2)\" more; \"(@Name)\" counts only those players, \"(!Name)\" everyone except them; \"(Chest 80%)\" switches on while the chests in the area (or the chest right under it) are at least 80% full (also \"<\", \">\", \"=\"), \"(Chest open)\" for a moment when one is opened (German: Kiste, offen). English and German. Native DLL, loaded by the dinput8.dll loader.",
+  "authors": ["CharosDX"],
+  "capabilities": []
+}
