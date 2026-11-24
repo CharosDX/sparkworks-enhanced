@@ -1,5 +1,6 @@
-// Sparkworks Enhanced: logic nodes Random Timer, Counter, Time, Random and Message in an own editor category, and trigger areas named
-// "... (N)", "(=N)", "(<N)", "(>N)", "(@Name)", "(!Name)", "(Kiste N%)" or "(Kiste offen)". In enshrouded_server.exe
+// Sparkworks Enhanced: logic nodes Random Timer, Counter, Environment (Time), Random and Alert (Message) in an own
+// editor category, and trigger areas named "... (N)", "(=N)", "(<N)", "(>N)", "(@Name)", "(!Name)", "(NPC)", "(!NPC)",
+// "(Kiste N%)" or "(Kiste offen)". In enshrouded_server.exe
 // only the parts that run, save and send are installed (no editor). Settings: config.ini, log: debug.log, both next
 // to the DLL.
 #include <windows.h>
@@ -155,6 +156,11 @@ static const char DESC_PATTERN[] = "48 81 C2 90 A1 00 00 41 80 F8 10 0F 87";
 #define TIME_MODE_NIGHT 0
 #define TIME_MODE_DAY 1
 #define TIME_MODE_SPAN 2
+#define TIME_MODE_RAIN 3   // weather modes: on while that weather is at the node's objects
+#define TIME_MODE_SNOW 4   // snow or blizzard
+#define TIME_MODE_CLEAR 5
+#define TIME_MODES 6
+#define ARG_WEATHER 3      // OP_TIME arg of the weather modes: 3 | kind << 2 | strand << 4 (kind = mode - RAIN)
 #define QUARTER (15 * MINUTE)
 #define NODE_INPUTS 0x30    // compiler node info: input id array, count (u64) at +0x38, 16 setting bytes at +0x78
 #define NODE_INPUT_COUNT 0x38
@@ -178,9 +184,9 @@ typedef struct {
 static NodeText node_texts[NODE_COUNT] = {
     {"Random Timer", 12, 0},
     {"Counter", 7, 0},
-    {"Time", 4, 0},
+    {"Environment", 11, 0},
     {"Random", 6, 0},
-    {"Message", 7, 0},
+    {"Alert", 5, 0},
 };
 
 #define TIME_OF_DAY 0x48  // ns since midnight
@@ -190,7 +196,7 @@ static NodeText node_texts[NODE_COUNT] = {
 #define BLOCK_DYNAMIC_NODE 0x10
 #define MAX_PATTERN 64
 #define MAX_WANTED 256  // different mod names (counts, player lists, chest conditions) in one world
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 #define MAX_NAME 65  // the editor allows 64 characters
 #define MAX_PLAYERS 8  // players listed in one "(@Name, ...)" or "(!Name, ...)"
 #define NAME_RECORD_CAPACITY 0x100  // name records: key, text pointer, length, capacity, 0, inline text
@@ -202,6 +208,9 @@ static NodeText node_texts[NODE_COUNT] = {
 #define LOAD_SCAN_DELAY_MS 2000   // after a world loads, its names are read this much later
 #define AREA_RECHECK_MS 250       // an active area's name is read again this often (renames)
 
+// "(NPC)": only entities without a player name (with "Triggered by: Player": the villagers, who share the
+// players' faction); "(!NPC)": only those with one (the players).
+enum { NPC_NONE, NPC_ONLY, NPC_EXCLUDED };
 // How a trigger area compares its count with N.
 enum { COMPARE_AT_LEAST, COMPARE_EQUAL, COMPARE_FEWER, COMPARE_MORE };
 // Chest areas: "(Kiste 80%)" / "(Chest 80%)" fill level, "(Kiste offen)" / "(Chest open)" opened.
@@ -218,6 +227,7 @@ typedef struct {
     uint8_t exclude;                // player filter: 1 = everyone except the listed players
     uint8_t chest;                  // CHEST_*
     uint8_t percent;                // chest fill level, compared with `compare`
+    uint8_t npc;                    // NPC_ONLY "(NPC)" or NPC_EXCLUDED "(!NPC)", 0 = no NPC tag
 } Wanted;
 
 // Every object name of the world: its key (fnv1a64 of the text, as in CustomPlayerString) and what it means for a
@@ -368,7 +378,9 @@ static uint32_t entity_of(uint32_t logic_id)
     return 0;
 }
 
-// Every logic entity's state read: remembers logic id -> entity for the Message node.
+static uint8_t *volatile logic_storage;  // component storage seen by notify_logic_state_change (weather positions)
+
+// Every logic entity's state read: remembers logic id -> entity for the Message and weather nodes.
 static void on_logic_state(uint8_t *state, uint8_t *node, uint8_t *block)
 {
     if (!state || !node || !current_entity || !block) return;
@@ -378,6 +390,8 @@ static void on_logic_state(uint8_t *state, uint8_t *node, uint8_t *block)
         if (logic && *logic && context) {
             current_entity(context, &entity);
             remember_entity(*logic, entity);
+            uint8_t *storage = *(uint8_t **)(*(uint8_t **)context + WORLD_FROM_CONTEXT);
+            if (storage) logic_storage = storage;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
@@ -722,7 +736,20 @@ static int on_trigger_match(uint8_t *state, uint32_t entity, uint8_t **context)
     }
     if (area->hold) return 0;
     const Wanted *mod = area->mod;
-    if (!mod || !(mod->required || mod->player_count)) return 1;
+    if (!mod || !(mod->required || mod->player_count || mod->npc)) return 1;
+    if (mod->npc) {
+        uint64_t key;
+        __try {
+            key = player_key(entity);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            key = 0;
+        }
+        static volatile LONG reported;
+        if (debug_log && InterlockedIncrement(&reported) <= 20) {
+            debug_line("area %s: entity %u %s", mod->name, entity, key ? "has a player name" : "has no player name");
+        }
+        if (mod->npc == NPC_ONLY ? key != 0 : key == 0) return 0;
+    }
     if (mod->player_count) {
         uint64_t key;
         __try {
@@ -741,6 +768,10 @@ static int on_trigger_match(uint8_t *state, uint32_t entity, uint8_t **context)
 
 // The area's result after all entities: chest areas and exact and "fewer" counts decide here, others keep the game's
 // result. iterator = logic_trigger_shape's view iterator, context = its system context.
+static int trigger_result_core(const Area *area, int matched, uint8_t *iterator);
+#define AREA_LOG_SLOTS 128   // areas whose changes are logged (debug=1)
+#define AREA_LOG_LINES 5000  // area change lines per game start
+
 static int on_trigger_result(uint8_t *state, int matched, uint8_t *iterator, uint8_t **context)
 {
     (void)state;
@@ -750,6 +781,47 @@ static int on_trigger_result(uint8_t *state, int matched, uint8_t *iterator, uin
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return matched;
     }
+    int result = trigger_result_core(area, matched, iterator);
+    if (debug_log) {  // debug=1: every change of an area's result (the game's and the mod's), for bug reports
+        static struct { uint32_t entity; int result, matched; } last[AREA_LOG_SLOTS];
+        static SRWLOCK last_lock = SRWLOCK_INIT;
+        static int lines;
+        AcquireSRWLockExclusive(&last_lock);
+        int at = 0;
+        while (at < AREA_LOG_SLOTS && last[at].entity && last[at].entity != area->entity) at++;
+        int fresh = at < AREA_LOG_SLOTS && last[at].entity != area->entity;
+        int report = at < AREA_LOG_SLOTS && lines <= AREA_LOG_LINES
+            && (fresh || last[at].result != result || last[at].matched != matched);
+        if (report) {
+            last[at].entity = area->entity;
+            last[at].result = result;
+            last[at].matched = matched;
+            lines++;
+        }
+        ReleaseSRWLockExclusive(&last_lock);
+        if (report && lines > AREA_LOG_LINES) {
+            log_line("%d trigger area changes logged, no more until the game restarts", AREA_LOG_LINES);
+        } else if (report) {
+            float size[3] = {0, 0, 0};
+            int shape = -1;
+            __try {
+                uint8_t *data = iterator ? *(uint8_t **)(iterator + TRIGGER_ITER_SHAPE) : NULL;
+                if (data) {
+                    shape = data[0];
+                    memcpy(size, data + 4, sizeof(size));
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            log_line("area %u \"%s\"%s: game %s -> mod %s (shape %d, %.1f x %.1f x %.1f)", area->entity,
+                area->mod ? area->mod->name : "ordinary", area->hold ? " HELD" : "", matched ? "on" : "off",
+                result ? "on" : "off", shape, size[0], size[1], size[2]);
+        }
+    }
+    return result;
+}
+
+static int trigger_result_core(const Area *area, int matched, uint8_t *iterator)
+{
     if (area->hold) return 0;
     const Wanted *mod = area->mod;
     if (!mod) return matched;
@@ -832,6 +904,27 @@ static int required_entities(const char *text, size_t length, uint8_t *compare)
 
 // Reads "(@Name)", "(@Name, @Other)" or the same with "!" (exclude) at the end of a name; "@" and "!" may also be
 // full-width. All entries need the same sign.
+// "(NPC)" / "(!NPC)" at the end of a name (case does not matter, a full-width ! counts too).
+static int parse_npc(const char *text, size_t length)
+{
+    const char *open = strrchr(text, '(');
+    if (length < 5 || text[length - 1] != ')' || !open) return NPC_NONE;
+    const char *at = open + 1, *end = text + length - 1;
+    while (at < end && *at == ' ') at++;
+    while (end > at && end[-1] == ' ') end--;
+    int exclude = 0;
+    if (at < end && *at == '!') {
+        exclude = 1;
+        at++;
+    } else if (end - at >= 3 && memcmp(at, "\xEF\xBC\x81", 3) == 0) {
+        exclude = 1;
+        at += 3;
+    }
+    while (at < end && *at == ' ') at++;
+    if (end - at != 3 || _strnicmp(at, "npc", 3) != 0) return NPC_NONE;
+    return exclude ? NPC_EXCLUDED : NPC_ONLY;
+}
+
 static int parse_players(const char *text, size_t length, uint64_t *players, uint8_t *player_count, uint8_t *exclude)
 {
     const char *open = strrchr(text, '(');
@@ -920,7 +1013,8 @@ static void read_names(NameTable *table)
                 if (fnv1a64(text) != p[0]) continue;
                 Wanted entry = {0};
                 entry.required = (uint8_t)required_entities(text, (size_t)p[2], &entry.compare);
-                int mod = entry.required
+                entry.npc = (uint8_t)parse_npc(text, (size_t)p[2]);
+                int mod = entry.required || entry.npc
                     || parse_players(text, (size_t)p[2], entry.players, &entry.player_count, &entry.exclude);
                 if (!mod) {
                     entry.chest = (uint8_t)parse_chest(text, (size_t)p[2], &entry.percent, &entry.compare);
@@ -1435,6 +1529,7 @@ static uint8_t random_output(const void *instruction, uint8_t input, uint32_t ar
 #define TIMER_DEFAULT_TO 4000
 #define TIMER_MAX_MS 3600000u     // From and To up to 1 h
 #define TIMER_MAX_SIGNAL 299999u  // the signal duration is saved in the sub-millisecond part
+#define SIGNAL_DELAY_OFF 1u       // signal "like the input, delayed off" (1 ms is no real step; saves like a time)
 #define TIMER_CONFIGS 65536  // the op argument has 16 bits
 
 // Compiled timer settings; the op argument is an index into this table.
@@ -1459,7 +1554,7 @@ static uint32_t timer_config_index(TimerConfig config)
 }
 
 // Per timer node: last input, phase, and when the current phase ends (GetTickCount64 ms).
-enum { DELAY_IDLE, DELAY_WAITING, DELAY_ON };
+enum { DELAY_IDLE, DELAY_WAITING, DELAY_ON, DELAY_OFF_WAITING };
 static struct { SlotKey key; uint8_t input, phase; ULONGLONG until; } delay_slots[RANDOM_SLOTS];
 
 // Delay: a signal waits a random time between From and To; then it follows the input (signal 0) or stays on
@@ -1489,6 +1584,28 @@ static uint8_t delay_output(const void *instruction, uint8_t input, uint32_t arg
         ReleaseSRWLockExclusive(&random_lock);
         return on;
     }
+    if (signal == SIGNAL_DELAY_OFF) {  // both edges wait a random time; a signal back while waiting to go off keeps it on
+        uint8_t phase = delay_slots[at].phase;
+        if (phase == DELAY_IDLE && input) {
+            phase = DELAY_WAITING;
+            delay_slots[at].until = now + low + random_below(high - low + 1);
+        }
+        if (phase == DELAY_WAITING) {
+            if (!input) phase = DELAY_IDLE;
+            else if (now >= delay_slots[at].until) phase = DELAY_ON;
+        }
+        if (phase == DELAY_ON && !input) {
+            phase = DELAY_OFF_WAITING;
+            delay_slots[at].until = now + low + random_below(high - low + 1);
+        }
+        if (phase == DELAY_OFF_WAITING) {
+            if (input) phase = DELAY_ON;
+            else if (now >= delay_slots[at].until) phase = DELAY_IDLE;
+        }
+        delay_slots[at].phase = phase;
+        ReleaseSRWLockExclusive(&random_lock);
+        return phase == DELAY_ON || phase == DELAY_OFF_WAITING;
+    }
     if (rising && delay_slots[at].phase == DELAY_IDLE) {
         delay_slots[at].phase = DELAY_WAITING;
         delay_slots[at].until = now + low + random_below(high - low + 1);
@@ -1512,7 +1629,14 @@ static uint8_t delay_output(const void *instruction, uint8_t input, uint32_t arg
 // OP_MESSAGE queues a message when its input turns on; the wrapped puzzle_completed_event system (or, while it is
 // idle, interaction_offer) sends it as a PuzzleCompletedEvent {player ids[16] +8, puzzle type +0x48, unlocked +0x49}.
 #define MESSAGE_CHOICES 8           // saved choice = puzzle type * 2 + was unlocked
-#define MESSAGE_OPTIONS 3           // dropdown entries: door, alarm raised, alarm resolved (no player-built barriers)
+#define MESSAGE_OPTIONS 4           // dropdown entries: door, alarm raised, alarm resolved, sound
+#define CHOICE_SOUND 2              // saved choice of the sound (puzzle type 1 is a barrier: unused); settings[1] = sound
+// Sound: an AreaDepositEvent {time, depositor +8, chests[32] +0xc, trigger prop +0x8c, result +0x90, sound guid +0x94}
+// with no chests makes every client's area_deposit_effects play the sound at the depositor's position.
+#define DEPOSIT_EVENT_TYPE 0x522b67acu
+#define DEPOSIT_EVENT_SIZE 0xa8
+#define DEPOSIT_BY 8
+#define DEPOSIT_SOUND 0x94
 #define PUZZLE_EVENT_TYPE 0x5a3baf30u
 #define PUZZLE_EVENT_SIZE 0x50
 #define PUZZLE_EVENT_PLAYERS 8
@@ -1526,13 +1650,92 @@ static uint8_t delay_output(const void *instruction, uint8_t input, uint32_t arg
 #define MAX_PENDING_MESSAGES 16
 // Dropdown texts (current language) and the saved choice of each option.
 static NodeText message_texts[MESSAGE_OPTIONS] = {
-    NODE_TEXT("Door opened"), NODE_TEXT("Alarm raised"), NODE_TEXT("Alarm resolved"),
+    NODE_TEXT("Door opened"), NODE_TEXT("Alarm raised"), NODE_TEXT("Alarm resolved"), NODE_TEXT("Sound"),
 };
-static const uint8_t OPTION_CHOICE[MESSAGE_OPTIONS] = {1, 6, 7};
+static const uint8_t OPTION_CHOICE[MESSAGE_OPTIONS] = {1, 6, 7, CHOICE_SOUND};
+// Sounds of the sound choice: positional sound containers of the game, by their guid. The list position is
+// what a node saves: new sounds are only appended. The panel lists the categories, then the sounds of the chosen one.
+enum { SOUND_SIGNALS, SOUND_ANIMALS, SOUND_ENEMIES, SOUND_ELEMENTS, SOUND_OBJECTS, SOUND_CATEGORIES };
+static const char *const SOUND_CATEGORY_NAMES[SOUND_CATEGORIES][2] = {
+    {"Signals", "Signale"}, {"Animals", "Tiere"}, {"Enemies", "Gegner"}, {"Elements", "Elemente"},
+    {"Objects", "Objekte"},
+};
+typedef struct { const char *en, *de, *guid; uint8_t category; } SoundChoice;
+static const SoundChoice SOUND_LIST[] = {
+    {"Gong", "Gong", "5e2d59b9-9ee8-49cc-bb49-c825a91b8b5f", SOUND_SIGNALS},
+    {"Horn", "Horn", "1b51d98e-dc86-44bc-ad71-b251e0edd7be", SOUND_SIGNALS},
+    {"Shrine", "Schrein", "d5a2eb90-fd85-47ff-9f34-0918a1fc7532", SOUND_SIGNALS},
+    {"Magic barrier", "Magiebarriere", "eb8ff6ca-d66d-4e52-b719-f1ddd7debe73", SOUND_SIGNALS},
+    {"Ancient gate", "Altes Tor", "b2576fdf-bc0b-4b70-a9eb-71ce292e4203", SOUND_SIGNALS},
+    {"Dog bark", "Hundebellen", "692eacac-24fa-4f1b-896b-ea688d88a2cf", SOUND_ANIMALS},
+    {"Hound growl", "Hundeknurren", "667e64ed-27dd-41d7-aa89-312d91a4db78", SOUND_ANIMALS},
+    {"Hound howl", "Hundeheulen", "09d145e5-ca2c-4b90-8244-949e99a3da4a", SOUND_ANIMALS},
+    {"Wolf howl", "Wolfsgeheul", "8aec283a-01b1-4e0e-abaa-9a720251744c", SOUND_ANIMALS},
+    {"Raven", "Rabe", "fbd0d9fa-d7a4-4998-91da-e58c92021e3e", SOUND_ANIMALS},
+    {"Bird", "Vogel", "e88e5294-574d-4d07-a95c-32a4b4a81aed", SOUND_ANIMALS},
+    {"Scavenger shout", "Plündererruf", "ebb7ba63-3eec-4e4b-8f1b-37aca96cab6f", SOUND_ENEMIES},
+    {"Shroud taunt", "Nebelspott", "10233e11-37a7-461f-86cd-012eae35a6bc", SOUND_ENEMIES},
+    {"Shroud caster", "Nebelmagier", "901e695a-4866-4037-82e8-2fd7eed9a996", SOUND_ENEMIES},
+    {"Brute taunt", "Rohlingsruf", "09c59f8b-9fea-413f-931a-44f79078c841", SOUND_ENEMIES},
+    {"Ancient alert", "Uralter Alarm", "dd62e2f9-383a-4ad6-ac54-5e5f208e62c6", SOUND_ENEMIES},
+    {"Ancient scream", "Uralter Schrei", "91779459-7a5f-4e86-b7af-8812e71defe5", SOUND_ENEMIES},
+    {"Lizard roar", "Echsengebrüll", "1c0e6808-703a-4de9-a6b8-50c9c298c8a5", SOUND_ENEMIES},
+    {"Beast growl", "Bestienknurren", "cc1408fa-6505-4f76-a3df-afca3f300da9", SOUND_ENEMIES},
+    {"Bonfire", "Lagerfeuer", "76152536-a8b2-4283-8058-83674693280c", SOUND_ELEMENTS},
+    {"Lightning", "Blitz", "7207fc9a-4888-4692-b678-cd42a3cd125e", SOUND_ELEMENTS},
+    {"Water bomb", "Wasserbombe", "5493e664-87a6-40b7-b644-49dda1527a60", SOUND_ELEMENTS},
+    {"Explosion", "Explosion", "e04775a1-e46f-43eb-a6c0-c7031adb9f00", SOUND_ELEMENTS},
+    {"Chest lock", "Kistenschloss", "361e327a-fa76-4c72-9eb5-ec7fcea8b33e", SOUND_OBJECTS},
+    {"Gold coins", "Goldmünzen", "c434a3f9-d255-4c26-bcad-1a3926410a80", SOUND_OBJECTS},
+    {"Paper tears", "Papier reißt", "af6f4726-c86c-4910-bcd5-4d80f9a7592c", SOUND_OBJECTS},
+    {"Pot breaks", "Krug zerbricht", "04281229-d558-4716-ad0f-061402b4f72c", SOUND_OBJECTS},
+    {"Wood breaks", "Holz bricht", "33584100-bd61-4101-966b-f59ff3f12349", SOUND_OBJECTS},
+};
+#define SOUND_COUNT (int)(sizeof(SOUND_LIST) / sizeof(SOUND_LIST[0]))
+static uint8_t sound_guids[SOUND_COUNT][16];  // in memory order (first three groups little endian)
+// A sound choice's compiled settings; the op argument is an index into this table.
+typedef struct { uint16_t sound; uint32_t strand; } SoundConfig;
+#define SOUND_CONFIGS 8192  // index in the 13 bits above the choice
+static SoundConfig sound_configs[SOUND_CONFIGS];
+static int sound_config_count;
+static SRWLOCK sound_lock = SRWLOCK_INIT;
 
-// Dropdown option of a saved choice (0, 1, 6 or 7).
+static void init_sounds(void)
+{
+    for (int i = 0; i < SOUND_COUNT; i++) {
+        unsigned a, b, c, d[8];
+        sscanf_s(SOUND_LIST[i].guid, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &a, &b, &c, &d[0], &d[1], &d[2], &d[3],
+            &d[4], &d[5], &d[6], &d[7]);
+        uint8_t *g = sound_guids[i];
+        memcpy(g, &a, 4);
+        uint16_t b16 = (uint16_t)b, c16 = (uint16_t)c;
+        memcpy(g + 4, &b16, 2);
+        memcpy(g + 6, &c16, 2);
+        for (int k = 0; k < 8; k++) g[8 + k] = (uint8_t)d[k];
+    }
+}
+
+static uint32_t sound_config_index(uint16_t sound, uint32_t strand)
+{
+    SoundConfig config = {sound, strand};
+    AcquireSRWLockExclusive(&sound_lock);
+    int at = 0;
+    while (at < sound_config_count && (sound_configs[at].sound != sound || sound_configs[at].strand != strand)) at++;
+    if (at == sound_config_count && at < SOUND_CONFIGS) sound_configs[sound_config_count++] = config;
+    int full = at >= SOUND_CONFIGS;
+    if (full) at = 0;
+    ReleaseSRWLockExclusive(&sound_lock);
+    static volatile LONG warned;
+    if (full && !InterlockedExchange(&warned, 1)) {
+        log_line("%d different sound settings used, newer ones play the first until restart", SOUND_CONFIGS);
+    }
+    return (uint32_t)at;
+}
+
+// Dropdown option of a saved choice (0, 1, 6, 7 or the sound).
 static uint32_t message_option(uint32_t choice)
 {
+    if (choice == CHOICE_SOUND) return 3;
     return choice >= 6 ? choice - 5 : 0;
 }
 typedef uint64_t (*SystemFn)(void *context, void *a, void *b, void *c);
@@ -1553,8 +1756,8 @@ static SRWLOCK message_lock = SRWLOCK_INIT;
 #define MESSAGE_SLOTS 1024
 static struct { SlotKey key; uint8_t input; } message_slots[MESSAGE_SLOTS];
 
-// Strand = logic ids of the world objects linked to a Message node. OP_MESSAGE's arg = choice | strand index << 3;
-// index 0 = no objects (everyone gets the message).
+// Strand = logic ids of the world objects linked to an Alert (Message) or weather node. OP_MESSAGE's arg =
+// choice | strand index << 3 (a sound: | sound config index << 3); index 0 = no objects (everyone gets the message).
 #define MAX_STRANDS 8192
 #define STRAND_OBJECTS 32
 typedef struct { uint8_t count; uint32_t ids[STRAND_OBJECTS]; } Strand;
@@ -1572,7 +1775,8 @@ static SRWLOCK strand_lock = SRWLOCK_INIT;
 #define TYPE_LOGIC_ENTITY 0
 #define MAX_GRAPH_NODES 256
 
-static uint32_t strand_of(void *ctx, uint8_t *info, uint32_t node_id)
+// forward = only the objects after the node (following links from their source to their target).
+static uint32_t strand_of(void *ctx, uint8_t *info, uint32_t node_id, int forward)
 {
     uint8_t *nodes = *(uint8_t **)(info + INFO_NODES), *links = *(uint8_t **)(info + INFO_LINKS);
     uint32_t node_count = *(uint32_t *)(info + INFO_NODES + 8), link_count = *(uint32_t *)(info + INFO_LINKS + 8);
@@ -1588,14 +1792,14 @@ static uint32_t strand_of(void *ctx, uint8_t *info, uint32_t node_id)
         slots = NULL;
     }
     if (!slots) return 0;
-    // Walk the links both ways from the Message node.
+    // Walk the links from the node (both ways unless forward).
     uint32_t ids[MAX_GRAPH_NODES];
     int count = 0;
     ids[count++] = node_id;
     for (int done = 0; done < count; done++) {
         for (uint32_t l = 0; l < link_count; l++) {
             uint32_t from = *(uint32_t *)(links + l * LINK_RECORD), to = *(uint32_t *)(links + l * LINK_RECORD + 4);
-            uint32_t other = from == ids[done] ? to : to == ids[done] ? from : 0;
+            uint32_t other = from == ids[done] ? to : to == ids[done] && !forward ? from : 0;
             if (!other) continue;
             int known = 0;
             for (int i = 0; i < count && !known; i++) known = ids[i] == other;
@@ -1629,7 +1833,7 @@ static uint32_t strand_of(void *ctx, uint8_t *info, uint32_t node_id)
     } else if (!index) {
         static volatile LONG warned;
         if (!InterlockedExchange(&warned, 1)) {
-            log_line("%d Message object groups in use, newer Message nodes go to every player", MAX_STRANDS);
+            log_line("%d object groups in use: newer Alert nodes reach every player, weather modes stay off", MAX_STRANDS);
         }
     }
     ReleaseSRWLockExclusive(&strand_lock);
@@ -1737,6 +1941,123 @@ static int message_recipients(uint32_t strand_index, void *world, void *transfor
     return count;
 }
 
+// ---- Weather ----
+// The game's weather sample(out, weather system, position, time) returns the shares of {clear, rain, snow, blizzard}
+// at a world position (they add up to 1). The call in actor_wet_soaked_apply (players and villagers getting wet)
+// is redirected to capture the weather system and the current weather time; the weather modes of the Environment
+// (Time) node sample at the first located object of their graph.
+typedef float *(*WeatherSampleFn)(float *out, void *weather, const int64_t *position, int64_t time);
+static WeatherSampleFn weather_sample;
+static void *volatile weather_system;
+static volatile int64_t weather_time;
+#define WEATHER_STRANDS 4096     // strand index in 12 bits of the arg
+#define WEATHER_RECHECK_MS 1000
+enum { WEATHER_CLEAR, WEATHER_RAIN, WEATHER_SNOW, WEATHER_BLIZZARD, WEATHER_SHARES };
+static struct { ULONGLONG checked; uint8_t ok; float shares[WEATHER_SHARES]; } weather_cache[WEATHER_STRANDS];
+static SRWLOCK weather_lock = SRWLOCK_INIT;
+
+static float *capture_weather(float *out, void *weather, const int64_t *position, int64_t time)
+{
+    float *result = weather_sample(out, weather, position, time);
+    weather_system = weather;
+    weather_time = time;
+    return result;
+}
+
+// Weather shares at the first located object of a strand, looked up at most once a second. 0 = not known (yet).
+static int strand_weather(uint32_t strand_index, float *shares)
+{
+    if (!strand_index || strand_index >= WEATHER_STRANDS || !weather_sample || !weather_system) return 0;
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockShared(&weather_lock);
+    int cached = weather_cache[strand_index].checked && now - weather_cache[strand_index].checked < WEATHER_RECHECK_MS;
+    int known = weather_cache[strand_index].ok;
+    if (cached && known) memcpy(shares, weather_cache[strand_index].shares, sizeof(float) * WEATHER_SHARES);
+    ReleaseSRWLockShared(&weather_lock);
+    if (cached) return known;
+    Strand strand;
+    AcquireSRWLockShared(&strand_lock);
+    strand = strands[strand_index];
+    ReleaseSRWLockShared(&strand_lock);
+    uint8_t *storage = chest_storage ? chest_storage : logic_storage;
+    int ok = 0;
+    __try {
+        for (int i = 0; storage && hash_lookup && i < strand.count && !ok; i++) {
+            uint32_t entity = entity_of(strand.ids[i]);
+            const int64_t *at = entity ? (const int64_t *)lookup(storage - storage_offset, TYPE_CURRENT_TRANSFORM,
+                entity) : NULL;
+            if (!at) continue;
+            int64_t position[3] = {at[0], at[1], at[2]};
+            __declspec(align(16)) float out[16] = {0};
+            float *result = weather_sample(out, weather_system, position, weather_time);
+            memcpy(shares, result, sizeof(float) * WEATHER_SHARES);
+            ok = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = 0;
+    }
+    AcquireSRWLockExclusive(&weather_lock);
+    weather_cache[strand_index].checked = now;
+    weather_cache[strand_index].ok = (uint8_t)ok;
+    if (ok) memcpy(weather_cache[strand_index].shares, shares, sizeof(float) * WEATHER_SHARES);
+    ReleaseSRWLockExclusive(&weather_lock);
+    return ok;
+}
+
+// Weather mode: kind 0 rain, 1 snow (or blizzard), 2 clear; on while it has more than half of the sky.
+static uint8_t weather_condition(uint32_t kind, uint32_t strand_index)
+{
+    float shares[WEATHER_SHARES];
+    if (!strand_weather(strand_index, shares)) return 0;
+    if (kind == 0) return shares[WEATHER_RAIN] > 0.5f;
+    if (kind == 1) return shares[WEATHER_SNOW] + shares[WEATHER_BLIZZARD] > 0.5f;
+    return shares[WEATHER_CLEAR] > 0.5f;
+}
+
+// Like system_function, but the name may follow any byte (actor_wet_soaked_apply sits right after other data).
+static uint8_t *system_function_any(uint8_t *data, uint8_t *data_end, const char *name)
+{
+    size_t length = strlen(name);
+    for (uint8_t *text = data; text + length + 1 <= data_end; text++) {
+        if (memcmp(text, name, length + 1) != 0) continue;
+        for (uint8_t *at = (uint8_t *)(((uintptr_t)data + 7) & ~(uintptr_t)7); at + 24 <= data_end; at += 8) {
+            if (*(uint8_t **)at == text && *(uint64_t *)(at + 8) == length) return *(uint8_t **)(at + 16);
+        }
+    }
+    return NULL;
+}
+
+// The sample call: the call in actor_wet_soaked_apply whose target (prologue "mov rax, rsp; mov [rax+x], rbx")
+// environmental_hazards calls too. Client and server builds differ in the sample's prologue, not in this shape.
+#define WEATHER_SEARCH_WET 0x800
+#define WEATHER_SEARCH_HAZARDS 0x1000
+static uint8_t *find_weather_call(uint8_t *image, SIZE_T image_size, uint8_t *data, uint8_t *data_end)
+{
+    uint8_t *wet = system_function_any(data, data_end, "actor_wet_soaked_apply");
+    uint8_t *hazards = system_function(data, data_end, "environmental_hazards");
+    if (!wet || !hazards) return NULL;
+    for (uint8_t *at = wet; at < wet + WEATHER_SEARCH_WET; at++) {
+        uint8_t *target = call_target(at);
+        if (!target || target < image || target >= image + image_size) continue;
+        if (memcmp(target, "\x48\x8B\xC4\x48\x89\x58", 6) != 0) continue;  // skips the view helpers both call
+        for (uint8_t *other = hazards; other < hazards + WEATHER_SEARCH_HAZARDS; other++) {
+            if (call_target(other) == target) return at;
+        }
+    }
+    return NULL;
+}
+
+static int install_weather(uint8_t *image, SIZE_T image_size, uint8_t *data, uint8_t *data_end)
+{
+    uint8_t *site = find_weather_call(image, image_size, data, data_end);
+    uint8_t *stub = site ? alloc_near(image, image_size) : NULL;
+    DWORD old;
+    if (!stub) return 0;
+    weather_sample = (WeatherSampleFn)call_target(site);
+    write_jump(stub, (void *)capture_weather);
+    return VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &old) && redirect_call(site, stub);
+}
+
 static int player_ids(const uint8_t *players, uint32_t *ids)
 {
     int count = 0;
@@ -1745,6 +2066,39 @@ static int player_ids(const uint8_t *players, uint32_t *ids)
         if (id) ids[count++] = id;
     }
     return count;
+}
+
+// Sound: plays at every known object of the strand (else at the first player).
+static void sound_at(void *writer, uint32_t entity, const uint64_t *sound)
+{
+    uint8_t *event = event_new(event_queue(writer), DEPOSIT_EVENT_TYPE, DEPOSIT_EVENT_SIZE, event_index(writer));
+    if (!event) return;
+    memset(event, 0, DEPOSIT_EVENT_SIZE);  // result 0 = success, no chests, no trigger prop
+    *(uint32_t *)(event + DEPOSIT_BY) = entity;
+    memcpy(event + DEPOSIT_SOUND, sound, 16);
+}
+
+static void send_sound(void *writer, uint32_t config_index, uint32_t fallback)
+{
+    SoundConfig config = sound_configs[config_index < SOUND_CONFIGS ? config_index : 0];
+    uint32_t strand_index = config.strand;
+    const uint64_t *sound = (const uint64_t *)sound_guids[config.sound < SOUND_COUNT ? config.sound : 0];
+    int sent = 0;
+    if (strand_index && strand_index < MAX_STRANDS) {
+        AcquireSRWLockShared(&strand_lock);
+        Strand strand = strands[strand_index];
+        ReleaseSRWLockShared(&strand_lock);
+        for (int i = 0; i < strand.count; i++) {
+            uint32_t entity = entity_of(strand.ids[i]);
+            if (entity) {
+                sound_at(writer, entity, sound);
+                sent++;
+            }
+        }
+    }
+    if (!sent && fallback) sound_at(writer, fallback, sound);
+    debug_line("message: sound %s at %d object(s)%s", SOUND_LIST[config.sound < SOUND_COUNT ? config.sound : 0].en,
+        sent, sent ? "" : ", none known: at the first player");
 }
 
 // Sends the waiting messages as PuzzleCompletedEvents through writer (a system context object).
@@ -1772,6 +2126,10 @@ static void send_core(const uint8_t *players, void *writer, void *world, void *t
     for (int m = 0; m < count; m++) {
         uint32_t choice = messages[m] % MESSAGE_CHOICES, strand = messages[m] >> 3, to[PLAYER_SLOTS];
         const char *name = message_texts[message_option(choice)].text;
+        if (choice == CHOICE_SOUND) {
+            send_sound(writer, strand, id_count ? ids[0] : 0);
+            continue;
+        }
         int located;
         int to_count = message_recipients(strand, world, transform, ids, id_count, to, &located);
         if (!to_count) {
@@ -2007,10 +2365,11 @@ static int quarter_of(uint64_t ns)
     return (int)((ns / QUARTER) % 96);
 }
 
-// OP_TIME: night, day or a span of quarter hours (may pass midnight).
+// OP_TIME: night, day, a span of quarter hours (may pass midnight) or weather.
 static uint8_t time_condition(uint32_t arg)
 {
     int mode = arg & 3;
+    if (mode == ARG_WEATHER) return weather_condition((arg >> 2) & 3, arg >> 4);
     if (mode == TIME_MODE_NIGHT) return node_night;
     if (mode == TIME_MODE_DAY) return !node_night;
     uint8_t *time = server_time;
@@ -2030,15 +2389,19 @@ enum { SETTING_MODE, SETTING_FROM, SETTING_TO };
 
 static void read_time_settings(const uint8_t *settings, int *mode, int *from, int *to)
 {
-    *mode = settings[SETTING_MODE] <= TIME_MODE_SPAN ? settings[SETTING_MODE] : TIME_MODE_NIGHT;
+    *mode = settings[SETTING_MODE] < TIME_MODES ? settings[SETTING_MODE] : TIME_MODE_NIGHT;
     *from = settings[SETTING_FROM] < HALF_HOURS ? settings[SETTING_FROM] : 0;
     *to = settings[SETTING_TO] < HALF_HOURS ? settings[SETTING_TO] : 0;
 }
 
-static uint32_t time_arg(const uint8_t *settings)
+// strand: the graph's objects, only for the weather modes (an index past 12 bits = none: the node stays off).
+static uint32_t time_arg(const uint8_t *settings, uint32_t strand)
 {
     int mode, from, to;
     read_time_settings(settings, &mode, &from, &to);
+    if (mode >= TIME_MODE_RAIN) {
+        return ARG_WEATHER | (uint32_t)(mode - TIME_MODE_RAIN) << 2 | (strand < WEATHER_STRANDS ? strand : 0) << 4;
+    }
     if (mode != TIME_MODE_SPAN) return (uint32_t)mode;
     return TIME_MODE_SPAN | (uint32_t)(from * 2) << 2 | (uint32_t)(to * 2) << 9;
 }
@@ -2079,7 +2442,7 @@ static void read_timer_settings(const uint8_t *settings, uint32_t *from, uint32_
     if (settings[TIMER_SETTING_MODE] < RANDOM_DELAY) {
         *from = TIMER_DEFAULT_FROM;
         *to = TIMER_DEFAULT_TO;
-        *signal = 0;
+        *signal = SIGNAL_DELAY_OFF;  // new nodes: on and off delayed
         return;
     }
     *from = clamp_ms(*(const uint32_t *)(settings + TIMER_SETTING_FROM), TIMER_MAX_MS);
@@ -2099,7 +2462,12 @@ static void write_timer_settings(uint8_t *settings, int mode, uint32_t from, uin
 static uint32_t message_choice(const uint8_t *settings)
 {
     uint8_t choice = settings[0];
-    return choice == 0 || choice == 6 || choice == 7 ? choice : 1;
+    return choice == 0 || choice == 6 || choice == 7 || choice == CHOICE_SOUND ? choice : 1;
+}
+
+static uint16_t message_sound(const uint8_t *settings)
+{
+    return settings[1] < SOUND_COUNT ? settings[1] : 0;
 }
 
 static uint32_t random_arg(const uint8_t *settings)
@@ -2112,6 +2480,13 @@ static uint32_t random_arg(const uint8_t *settings)
 static void describe_arg(uint32_t arg, char *text, size_t size)
 {
     int mode = arg & 3;
+    if (mode == ARG_WEATHER) {
+        static const char *KINDS[] = {"rain", "snow", "clear", "?"};
+        uint32_t strand = arg >> 4;
+        sprintf_s(text, size, "%s, strand %u (%u objects)", KINDS[(arg >> 2) & 3], strand,
+            strand ? strands[strand].count : 0);
+        return;
+    }
     if (mode != TIME_MODE_SPAN) {
         strcpy_s(text, size, mode == TIME_MODE_NIGHT ? "night" : "day");
         return;
@@ -2173,10 +2548,16 @@ static uint8_t compile_node(void *ctx, uint8_t *info, uint32_t type, uint8_t *no
         arg = random_arg(info + NODE_SETTINGS);
     } else if (type == NODE_MESSAGE) {
         op = OP_MESSAGE;
-        arg = message_choice(info + NODE_SETTINGS) | strand_of(ctx, info, node_id) << 3;
+        uint32_t choice = message_choice(info + NODE_SETTINGS), strand = 0;
+        if (choice == CHOICE_SOUND) strand = strand_of(ctx, info, node_id, 1);  // the sound comes from what follows
+        if (!strand) strand = strand_of(ctx, info, node_id, 0);
+        arg = choice | (choice == CHOICE_SOUND ? sound_config_index(message_sound(info + NODE_SETTINGS), strand) : strand)
+            << 3;
     } else {
         op = OP_TIME;
-        arg = time_arg(info + NODE_SETTINGS);
+        int weather = info[NODE_SETTINGS + SETTING_MODE] >= TIME_MODE_RAIN
+            && info[NODE_SETTINGS + SETTING_MODE] < TIME_MODES;
+        arg = time_arg(info + NODE_SETTINGS, weather ? strand_of(ctx, info, node_id, 0) : 0);
     }
     if (!emit(ctx, op | arg << 16)) return COMPILE_EMIT_FAILED;
     // Log only changes; graphs recompile often.
@@ -2310,7 +2691,8 @@ static int find_panel_layout(uint8_t *timed_case)
 }
 
 // Panel texts (current language).
-static NodeText mode_texts[] = {NODE_TEXT("Night"), NODE_TEXT("Day"), NODE_TEXT("Time span")};
+static NodeText mode_texts[TIME_MODES] = {NODE_TEXT("Night"), NODE_TEXT("Day"), NODE_TEXT("Time span"),
+    NODE_TEXT("Rain"), NODE_TEXT("Snow"), NODE_TEXT("Clear")};
 static NodeText panel_labels[] = {NODE_TEXT("Mode"), NODE_TEXT("From"), NODE_TEXT("To")};
 static NodeText random_modes[] = {NODE_TEXT("Pass through"), NODE_TEXT("Hold"), NODE_TEXT("Delay"),
     NODE_TEXT("Clock")};
@@ -2320,27 +2702,37 @@ static const char *hold_word = "hold";
 static const char *pulse_word = "clock";
 static NodeText node_descriptions[NODE_COUNT];
 static NodeText message_label = NODE_TEXT("Message");
+static NodeText sound_label = NODE_TEXT("Sound");
+static NodeText category_label = NODE_TEXT("Type");
 static NodeText counter_label = NODE_TEXT("Count");
 static NodeText empty_text = {"", 0, 0};
 
 // Texts per language; the language is taken from the game's name of the Clock node.
-enum { DESC_RANDOM = 0, DESC_TIME = 2, DESC_TIMER = 5, MODE_DESCRIPTIONS = 7 };
+enum { DESC_RANDOM = 0, DESC_TIME = 2, DESC_TIMER = 5, DESC_WEATHER = 7, DESC_DELAY_ON = 10, DESC_DELAY_FIXED = 11,
+    MODE_DESCRIPTIONS = 12 };
 enum { LANGUAGE_ENGLISH, LANGUAGE_GERMAN, LANGUAGE_COUNT };
 typedef struct {
     const char *name, *clock;  // clock = the game's Clock node name in this language (NULL = default)
-    NodeText nodes[NODE_COUNT], modes[3], labels[3], random_modes[4], random_labels[5];
+    NodeText nodes[NODE_COUNT], modes[TIME_MODES], labels[3], random_modes[4], random_labels[5];
     const char *hold, *pulse;  // node subtitle suffixes of a holding Random / a clock Random Timer node
     NodeText descriptions[NODE_COUNT];  // shown at the top of the properties panel (nodes without modes)
-    NodeText mode_descriptions[MODE_DESCRIPTIONS];  // per mode: Random 0-1, Time 2-4, Random Timer 5-6
+    // per mode: Random 0-1, Time 2-4, Random Timer 5-6 (delay On/Off, clock), weather 7-9, delay Only on 10,
+    // delay with a fixed time 11
+    NodeText mode_descriptions[MODE_DESCRIPTIONS];
     NodeText message_label;
     NodeText counter_label;
     NodeText messages[MESSAGE_OPTIONS];
-    NodeText like_input;         // first entry of the delay's Signal dropdown
-    char decimal;                // decimal separator in node subtitles
+    NodeText like_input;         // Signal dropdown: like the input, only switching on is delayed (stored 0)
+    NodeText like_input_off;     // Signal dropdown, first entry: like the input, on and off delayed
+    const char *on_off;          // node subtitle suffix of a delay that also delays going off
+    char decimal;               // decimal separator in node subtitles
+    NodeText sound_label;       // Message node: second dropdown of the sound choice
+    NodeText sound_description; // Message node description while the sound choice is picked
 } Language;
 static Language languages[LANGUAGE_COUNT] = {
-    {"English", NULL, {NODE_TEXT("Random Timer"), NODE_TEXT("Counter"), NODE_TEXT("Time"), NODE_TEXT("Random"), NODE_TEXT("Message")},
-        {NODE_TEXT("Night"), NODE_TEXT("Day"), NODE_TEXT("Time span")},
+    {"English", NULL, {NODE_TEXT("Random Timer"), NODE_TEXT("Counter"), NODE_TEXT("Environment"), NODE_TEXT("Random"), NODE_TEXT("Alert")},
+        {NODE_TEXT("Night"), NODE_TEXT("Day"), NODE_TEXT("Time span"), NODE_TEXT("Rain"), NODE_TEXT("Snow"),
+            NODE_TEXT("Clear")},
         {NODE_TEXT("Mode"), NODE_TEXT("From"), NODE_TEXT("To")},
         {NODE_TEXT("Pass through"), NODE_TEXT("Hold"), NODE_TEXT("Delay"), NODE_TEXT("Clock")},
         {NODE_TEXT("Mode"), NODE_TEXT("Chance"), NODE_TEXT("From"), NODE_TEXT("To"), NODE_TEXT("Signal")}, "hold", "clock",
@@ -2356,14 +2748,25 @@ static Language languages[LANGUAGE_COUNT] = {
             NODE_TEXT("Night: on at night (22:00 to 06:00, in-game time)."),
             NODE_TEXT("Day: on during the day (06:00 to 22:00, in-game time)."),
             NODE_TEXT("Time span: on between From and To (in-game time)."),
-            NODE_TEXT("Delay: waits a random time between From and To for each signal, then passes it on."),
+            NODE_TEXT("Delay: switches on after a random time between From and To. When the signal ends, it "
+                "switches off after a random time too."),
             NODE_TEXT("Clock: switches on and off at random intervals between From and To for as long as a signal "
-                "comes in.")},
+                "comes in."),
+            NODE_TEXT("Rain: on while it rains where the objects of this graph are."),
+            NODE_TEXT("Snow: on while it snows where the objects of this graph are."),
+            NODE_TEXT("Clear: on while the sky is clear where the objects of this graph are."),
+            NODE_TEXT("Delay: switches on after a random time between From and To. When the signal ends, it "
+                "switches off right away."),
+            NODE_TEXT("Delay: switches on after a random time between From and To, and off again after the chosen "
+                "time, even if the signal is still there.")},
         NODE_TEXT("Message"), NODE_TEXT("Count"),
-        {NODE_TEXT("Door opened"), NODE_TEXT("Alarm raised"), NODE_TEXT("Alarm resolved")},
-        NODE_TEXT("Like the input"), '.'},
-    {"German", "Uhr", {NODE_TEXT("Zufallstimer"), NODE_TEXT("Zähler"), NODE_TEXT("Zeit"), NODE_TEXT("Zufall"), NODE_TEXT("Meldung")},
-        {NODE_TEXT("Nacht"), NODE_TEXT("Tag"), NODE_TEXT("Zeitspanne")},
+        {NODE_TEXT("Door opened"), NODE_TEXT("Alarm raised"), NODE_TEXT("Alarm resolved"), NODE_TEXT("Sound")},
+        NODE_TEXT("Only on"), NODE_TEXT("On/Off"), "on/off", '.', NODE_TEXT("Sound"),
+        NODE_TEXT("Plays the chosen sound at the objects after this node every time a signal comes in. The signal "
+            "is passed on unchanged.")},
+    {"German", "Uhr", {NODE_TEXT("Zufallstimer"), NODE_TEXT("Zähler"), NODE_TEXT("Umgebung"), NODE_TEXT("Zufall"), NODE_TEXT("Melder")},
+        {NODE_TEXT("Nacht"), NODE_TEXT("Tag"), NODE_TEXT("Zeitspanne"), NODE_TEXT("Regen"), NODE_TEXT("Schnee"),
+            NODE_TEXT("Klar")},
         {NODE_TEXT("Modus"), NODE_TEXT("Von"), NODE_TEXT("Bis")},
         {NODE_TEXT("Durchlassen"), NODE_TEXT("Halten"), NODE_TEXT("Verzögern"), NODE_TEXT("Takt")},
         {NODE_TEXT("Modus"), NODE_TEXT("Chance"), NODE_TEXT("Von"), NODE_TEXT("Bis"), NODE_TEXT("Signal")}, "halten",
@@ -2380,13 +2783,22 @@ static Language languages[LANGUAGE_COUNT] = {
             NODE_TEXT("Nacht: An bei Nacht (22:00 bis 06:00 Spielzeit)."),
             NODE_TEXT("Tag: An bei Tag (06:00 bis 22:00 Spielzeit)."),
             NODE_TEXT("Zeitspanne: An zwischen Von und Bis (Spielzeit)."),
-            NODE_TEXT("Verzögern: Wartet bei jedem Signal eine zufällige Zeit zwischen Von und Bis und gibt es "
-                "dann weiter."),
+            NODE_TEXT("Verzögern: Schaltet zufällig zwischen Von und Bis verzögert an. Endet das Signal, schaltet "
+                "es genauso verzögert aus."),
             NODE_TEXT("Takt: Geht in zufälligen Abständen zwischen Von und Bis an und aus, solange ein Signal "
-                "ankommt.")},
+                "ankommt."),
+            NODE_TEXT("Regen: An, solange es dort regnet, wo die Objekte dieses Graphen stehen."),
+            NODE_TEXT("Schnee: An, solange es dort schneit, wo die Objekte dieses Graphen stehen."),
+            NODE_TEXT("Klar: An, solange der Himmel dort klar ist, wo die Objekte dieses Graphen stehen."),
+            NODE_TEXT("Verzögern: Schaltet zufällig zwischen Von und Bis verzögert an. Endet das Signal, schaltet "
+                "es sofort aus."),
+            NODE_TEXT("Verzögern: Schaltet zufällig zwischen Von und Bis verzögert an und nach der gewählten Zeit "
+                "wieder aus, auch wenn das Signal noch anliegt.")},
         NODE_TEXT("Meldung"), NODE_TEXT("Anzahl"),
-        {NODE_TEXT("Tür geöffnet"), NODE_TEXT("Alarm ausgelöst"), NODE_TEXT("Alarm aufgehoben")},
-        NODE_TEXT("Wie Eingang"), ','},
+        {NODE_TEXT("Tür geöffnet"), NODE_TEXT("Alarm ausgelöst"), NODE_TEXT("Alarm aufgehoben"), NODE_TEXT("Ton")},
+        NODE_TEXT("Nur an"), NODE_TEXT("An/Aus"), "an/aus", ',', NODE_TEXT("Ton"),
+        NODE_TEXT("Spielt jedes Mal, wenn ein Signal ankommt, den gewählten Ton an den Objekten nach diesem Node. "
+            "Das Signal wird unverändert weitergegeben.")},
 };
 #define TYPE_CLOCK 2
 #define LANGUAGE_CHECK_MS 3000
@@ -2405,16 +2817,19 @@ static void init_languages(void)
     for (int l = 0; l < LANGUAGE_COUNT; l++) {
         Language *lang = &languages[l];
         hash_texts(lang->nodes, NODE_COUNT);
-        hash_texts(lang->modes, 3);
+        hash_texts(lang->modes, TIME_MODES);
         hash_texts(lang->labels, 3);
         hash_texts(lang->random_modes, 4);
         hash_texts(lang->random_labels, 5);
         hash_texts(&lang->like_input, 1);
+        hash_texts(&lang->like_input_off, 1);
         hash_texts(lang->mode_descriptions, MODE_DESCRIPTIONS);
         hash_texts(lang->descriptions, NODE_COUNT);
         hash_texts(&lang->message_label, 1);
         hash_texts(lang->messages, MESSAGE_OPTIONS);
         hash_texts(&lang->counter_label, 1);
+        hash_texts(&lang->sound_label, 1);
+        hash_texts(&lang->sound_description, 1);
     }
     // English until update_language finds the game's language.
     const Language *english = &languages[LANGUAGE_ENGLISH];
@@ -2427,6 +2842,8 @@ static void init_languages(void)
     memcpy(node_descriptions, english->descriptions, sizeof(node_descriptions));
     message_label = english->message_label;
     counter_label = english->counter_label;
+    sound_label = english->sound_label;
+    category_label.hash = fnv1a64(category_label.text);
 }
 
 // Checks the game language every few seconds and switches the texts.
@@ -2459,21 +2876,26 @@ static void update_language(void)
     message_label = lang->message_label;
     memcpy(message_texts, lang->messages, sizeof(lang->messages));
     counter_label = lang->counter_label;
+    sound_label = lang->sound_label;
+    category_label = (NodeText){found == LANGUAGE_GERMAN ? "Art" : "Type", found == LANGUAGE_GERMAN ? 3 : 4,
+        fnv1a64(found == LANGUAGE_GERMAN ? "Art" : "Type")};
     log_line("node texts: %s", lang->name);
 }
 
-// Fixed signal times of the delay's Signal dropdown (entry 0 = like the input).
+// Fixed signal times of the delay's Signal dropdown (entry 0 = on and off delayed, 1 = only on delayed).
 static const uint32_t SIGNAL_STEPS[] = {100, 200, 300, 500, 1000, 1500, 2000, 3000, 4000, 5000, 10000, 15000, 20000,
     30000, 45000, 60000, 120000};
 #define SIGNAL_STEP_COUNT (int)(sizeof(SIGNAL_STEPS) / sizeof(SIGNAL_STEPS[0]))
+#define SIGNAL_FIRST_STEP 2  // dropdown entry of SIGNAL_STEPS[0]
 static char signal_names[LANGUAGE_COUNT][SIGNAL_STEP_COUNT][12];
-static NodeText signal_texts[LANGUAGE_COUNT][SIGNAL_STEP_COUNT + 1];
+static NodeText signal_texts[LANGUAGE_COUNT][SIGNAL_STEP_COUNT + SIGNAL_FIRST_STEP];
 static void format_seconds(uint32_t ms, char decimal, char *text, size_t size);
 
 static void init_signal_texts(void)
 {
     for (int l = 0; l < LANGUAGE_COUNT; l++) {
-        signal_texts[l][0] = languages[l].like_input;
+        signal_texts[l][0] = languages[l].like_input_off;
+        signal_texts[l][1] = languages[l].like_input;
         for (int i = 0; i < SIGNAL_STEP_COUNT; i++) {
             char number[8], *name = signal_names[l][i];
             if (SIGNAL_STEPS[i] >= 120000) {
@@ -2482,23 +2904,30 @@ static void init_signal_texts(void)
                 format_seconds(SIGNAL_STEPS[i], languages[l].decimal, number, sizeof(number));
                 sprintf_s(name, sizeof(signal_names[l][i]), "%s s", number);
             }
-            signal_texts[l][i + 1] = (NodeText){name, strlen(name), fnv1a64(name)};
+            signal_texts[l][i + SIGNAL_FIRST_STEP] = (NodeText){name, strlen(name), fnv1a64(name)};
         }
     }
 }
 
-// Dropdown entry of a signal time: 0 = like the input, else the nearest step.
+// Dropdown entry of a signal time: 0 = on and off delayed, 1 = only on delayed (stored 0), else the nearest step.
 static uint32_t signal_entry(uint32_t ms)
 {
-    if (!ms) return 0;
+    if (ms == SIGNAL_DELAY_OFF) return 0;
+    if (!ms) return 1;
     uint32_t best = 0;
     for (int i = 1; i < SIGNAL_STEP_COUNT; i++) {
         uint32_t d = SIGNAL_STEPS[i] > ms ? SIGNAL_STEPS[i] - ms : ms - SIGNAL_STEPS[i];
         uint32_t b = SIGNAL_STEPS[best] > ms ? SIGNAL_STEPS[best] - ms : ms - SIGNAL_STEPS[best];
         if (d < b) best = (uint32_t)i;
     }
-    return best + 1;
+    return best + SIGNAL_FIRST_STEP;
 }
+
+static NodeText sound_texts[LANGUAGE_COUNT][SOUND_COUNT];
+static NodeText category_texts[LANGUAGE_COUNT][SOUND_CATEGORIES];
+static NodeText category_sound_texts[LANGUAGE_COUNT][SOUND_CATEGORIES][SOUND_COUNT];
+static uint8_t category_sounds[SOUND_CATEGORIES][SOUND_COUNT];  // sound indices of each category, in list order
+static int category_count[SOUND_CATEGORIES];
 
 #define CHANCE_STEPS 20  // 5 % .. 100 %
 static char chance_names[CHANCE_STEPS][6];
@@ -2524,6 +2953,20 @@ static void init_panel_texts(void)
         chance_texts[i] = (NodeText){chance_names[i], strlen(chance_names[i]), fnv1a64(chance_names[i])};
     }
     init_signal_texts();
+    init_sounds();
+    for (int i = 0; i < SOUND_COUNT; i++) {
+        sound_texts[LANGUAGE_ENGLISH][i] = (NodeText){SOUND_LIST[i].en, strlen(SOUND_LIST[i].en), fnv1a64(SOUND_LIST[i].en)};
+        sound_texts[LANGUAGE_GERMAN][i] = (NodeText){SOUND_LIST[i].de, strlen(SOUND_LIST[i].de), fnv1a64(SOUND_LIST[i].de)};
+        int c = SOUND_LIST[i].category, at = category_count[c]++;
+        category_sounds[c][at] = (uint8_t)i;
+        for (int l = 0; l < LANGUAGE_COUNT; l++) category_sound_texts[l][c][at] = sound_texts[l][i];
+    }
+    for (int l = 0; l < LANGUAGE_COUNT; l++) {
+        for (int c = 0; c < SOUND_CATEGORIES; c++) {
+            const char *name = SOUND_CATEGORY_NAMES[c][l];
+            category_texts[l][c] = (NodeText){name, strlen(name), fnv1a64(name)};
+        }
+    }
 }
 
 static float font_scale(void)
@@ -2578,7 +3021,7 @@ static int time_controls(uint8_t *block, uint64_t gap, const uint8_t *settings, 
     next[SETTING_TO] = (uint8_t)to;
     uint32_t picked;
     int changed = 0;
-    if (draw_dropdown(0, &panel_labels[0], mode_texts, 3, (uint32_t)mode, refresh, &picked)) {
+    if (draw_dropdown(0, &panel_labels[0], mode_texts, TIME_MODES, (uint32_t)mode, refresh, &picked)) {
         changed = 1;
         next[SETTING_MODE] = (uint8_t)picked;
         if (picked == TIME_MODE_SPAN && from == to) {  // fresh span: 18:00-23:00
@@ -2653,10 +3096,11 @@ static int timer_controls(uint8_t *block, uint64_t gap, const uint8_t *settings,
     ui.gap_fn(block, gap);
     if (mode == RANDOM_DELAY) {
         int l = language >= 0 ? language : LANGUAGE_ENGLISH;
-        if (draw_dropdown(10, &random_labels[4], signal_texts[l], SIGNAL_STEP_COUNT + 1, signal_entry(signal), refresh,
-                &picked)) {
+        if (draw_dropdown(10, &random_labels[4], signal_texts[l], SIGNAL_STEP_COUNT + SIGNAL_FIRST_STEP,
+                signal_entry(signal), refresh, &picked)) {
             changed = 1;
-            signal = picked ? SIGNAL_STEPS[picked - 1] : 0;
+            signal = picked >= SIGNAL_FIRST_STEP ? SIGNAL_STEPS[picked - SIGNAL_FIRST_STEP]
+                : picked ? 0 : SIGNAL_DELAY_OFF;
         }
         ui.gap_fn(block, gap);
     }
@@ -2684,11 +3128,43 @@ static int message_controls(uint8_t *block, uint64_t gap, const uint8_t *setting
     uint32_t choice = message_choice(settings), picked;
     next[0] = (uint8_t)choice;
     int changed = 0;
-    if (draw_dropdown(5, &message_label, message_texts, MESSAGE_OPTIONS, message_option(choice), refresh, &picked)) {
+    next[1] = (uint8_t)message_sound(settings);
+    // Mode: a message (the game's banners) or a sound; below it the list of that mode.
+    static NodeText notify_modes[2];
+    notify_modes[0] = message_label;
+    notify_modes[1] = message_texts[MESSAGE_OPTIONS - 1];
+    if (draw_dropdown(5, &panel_labels[0], notify_modes, 2, choice == CHOICE_SOUND, refresh, &picked)) {
         changed = 1;
-        next[0] = OPTION_CHOICE[picked];
+        next[0] = picked ? CHOICE_SOUND : OPTION_CHOICE[0];
     }
     ui.gap_fn(block, gap);
+    if (next[0] != CHOICE_SOUND) {
+        if (draw_dropdown(12, &message_label, message_texts, MESSAGE_OPTIONS - 1, message_option(next[0]), refresh,
+                &picked)) {
+            changed = 1;
+            next[0] = OPTION_CHOICE[picked];
+        }
+        ui.gap_fn(block, gap);
+    } else {
+        int l = language >= 0 ? language : LANGUAGE_ENGLISH;
+        int category = SOUND_LIST[next[1]].category, position = 0;
+        if (draw_dropdown(13, &category_label, category_texts[l], SOUND_CATEGORIES, (uint32_t)category, refresh,
+                &picked) && (int)picked != category && category_count[picked]) {
+            changed = 1;
+            category = (int)picked;
+            next[1] = category_sounds[category][0];
+        }
+        ui.gap_fn(block, gap);
+        for (int i = 0; i < category_count[category]; i++) {
+            if (category_sounds[category][i] == next[1]) position = i;
+        }
+        if (draw_dropdown(11, &sound_label, category_sound_texts[l][category], category_count[category],
+                (uint32_t)position, refresh, &picked)) {
+            changed = 1;
+            next[1] = category_sounds[category][picked];
+        }
+        ui.gap_fn(block, gap);
+    }
     return changed;
 }
 
@@ -2901,6 +3377,8 @@ static const NodeText *delay_subtitle(const uint8_t *settings, int pulse)
     else sprintf_s(range, sizeof(range), "%s-%s s", low, high);
     if (pulse) {
         sprintf_s(names[at], sizeof(names[at]), "%s %s", range, pulse_word);
+    } else if (signal == SIGNAL_DELAY_OFF) {
+        sprintf_s(names[at], sizeof(names[at]), "%s %s", range, languages[language >= 0 ? language : LANGUAGE_ENGLISH].on_off);
     } else if (signal) {
         format_seconds(signal, decimal, low, sizeof(low));
         sprintf_s(names[at], sizeof(names[at]), "%s (%s s)", range, low);
@@ -2954,7 +3432,9 @@ static void node_header(uint8_t *header, uint8_t *node, const uint8_t *result, u
     if (!result[0]) memcpy(settings, result + 8, sizeof(settings));
     const NodeText *subtitle = type == NODE_RANDOM ? random_subtitle(settings)
         : type == NODE_RANDOM_TIMER ? delay_subtitle(settings, timer_mode(settings) == RANDOM_PULSE)
-        : type == NODE_MESSAGE ? &message_texts[message_option(message_choice(settings))]
+        : type == NODE_MESSAGE ? (message_choice(settings) == CHOICE_SOUND
+            ? &sound_texts[language >= 0 ? language : LANGUAGE_ENGLISH][message_sound(settings)]
+            : &message_texts[message_option(message_choice(settings))])
         : type == NODE_COUNTER ? counter_subtitle(node, settings) : time_subtitle(settings);
     memcpy(header + HEADER_SUBTITLE, subtitle, sizeof(NodeText));
 }
@@ -3132,7 +3612,7 @@ static uint8_t *write_node_data_stub(uint8_t *stub, uint8_t *site)
 // ---- Disguise in saves and graph transfers ----
 // Mod nodes with settings are saved as TimedTriggers with the settings in the sub-millisecond part of their times,
 // which the editor cannot produce. Without the mod they load as 1 s TimedTriggers.
-// Time: delay = 1 s + DISGUISE_MARK + mode, duration = 1 s + DISGUISE_MARK + from * 64 + to.
+// Time (Environment): delay = 1 s + DISGUISE_MARK + mode (0..5), duration = 1 s + DISGUISE_MARK + from * 64 + to.
 #define DISGUISE_BASE 1000000000ull
 #define DISGUISE_MARK 700000ull
 #define DISGUISE_SPAN 4096ull
@@ -3144,7 +3624,7 @@ static __declspec(thread) uint64_t disguised[2];
 #define DISGUISE_TIMER 64
 #define MS 1000000ull
 #define DISGUISE_RANDOM 16
-// Message: delay = 1 s + DISGUISE_MARK + DISGUISE_MESSAGE + choice, duration = 1 s + DISGUISE_MARK.
+// Message: delay = 1 s + DISGUISE_MARK + DISGUISE_MESSAGE + choice, duration = 1 s + DISGUISE_MARK (+ sound).
 #define DISGUISE_MESSAGE 32
 // Counter: delay = 1 s + DISGUISE_MARK + DISGUISE_COUNTER, duration = 1 s + DISGUISE_MARK + N.
 #define DISGUISE_COUNTER 48
@@ -3157,8 +3637,9 @@ static const uint8_t *disguise_settings(const uint8_t *settings, uint32_t type)
         return (const uint8_t *)disguised;
     }
     if (type == NODE_MESSAGE) {
-        disguised[0] = DISGUISE_BASE + DISGUISE_MARK + DISGUISE_MESSAGE + message_choice(settings);
-        disguised[1] = DISGUISE_BASE + DISGUISE_MARK;
+        uint32_t choice = message_choice(settings);
+        disguised[0] = DISGUISE_BASE + DISGUISE_MARK + DISGUISE_MESSAGE + choice;
+        disguised[1] = DISGUISE_BASE + DISGUISE_MARK + (choice == CHOICE_SOUND ? message_sound(settings) : 0);
         return (const uint8_t *)disguised;
     }
     if (type == NODE_RANDOM_TIMER) {
@@ -3205,10 +3686,12 @@ static void undisguise_node(uint8_t *node, uint8_t *data)
         data[0] = (uint8_t)span;
         return;
     }
-    if (mode >= DISGUISE_MESSAGE && mode < DISGUISE_MESSAGE + MESSAGE_CHOICES && span == 0) {
+    if (mode >= DISGUISE_MESSAGE && mode < DISGUISE_MESSAGE + MESSAGE_CHOICES
+        && (span == 0 || (mode == DISGUISE_MESSAGE + CHOICE_SOUND && span < SOUND_COUNT))) {
         node[0] = NODE_MESSAGE;
         memset(data, 0, 16);
         data[0] = (uint8_t)(mode - DISGUISE_MESSAGE);
+        data[1] = (uint8_t)span;
         return;
     }
     if ((mode == DISGUISE_RANDOM + RANDOM_GATE || mode == DISGUISE_RANDOM + RANDOM_HOLD) && span >= 1 && span <= 100) {
@@ -3218,7 +3701,7 @@ static void undisguise_node(uint8_t *node, uint8_t *data)
         data[RANDOM_SETTING_CHANCE] = (uint8_t)span;
         return;
     }
-    if (mode > TIME_MODE_SPAN || span >= DISGUISE_SPAN || span / 64 >= HALF_HOURS || span % 64 >= HALF_HOURS) return;
+    if (mode >= TIME_MODES || span >= DISGUISE_SPAN || span / 64 >= HALF_HOURS || span % 64 >= HALF_HOURS) return;
     node[0] = NODE_TIME;
     memset(data, 0, 16);
     data[SETTING_MODE] = (uint8_t)mode;
@@ -3331,14 +3814,22 @@ static const NodeText *node_description(uint32_t type)
     update_language();
     const NodeText *modes = languages[language >= 0 ? language : LANGUAGE_ENGLISH].mode_descriptions;
     int mode, a, b;
-    if (type == NODE_RANDOM_TIMER) return &modes[DESC_TIMER + timer_mode(panel_settings) - RANDOM_DELAY];
+    if (type == NODE_RANDOM_TIMER) {
+        if (timer_mode(panel_settings) != RANDOM_DELAY) return &modes[DESC_TIMER + 1];
+        uint32_t from, to, signal;
+        read_timer_settings(panel_settings, &from, &to, &signal);
+        return &modes[signal == SIGNAL_DELAY_OFF ? DESC_TIMER : signal ? DESC_DELAY_FIXED : DESC_DELAY_ON];
+    }
     if (type == NODE_RANDOM) {
         read_random_settings(panel_settings, &mode, &a);
         return &modes[DESC_RANDOM + mode];
     }
     if (type == NODE_TIME) {
         read_time_settings(panel_settings, &mode, &a, &b);
-        return &modes[DESC_TIME + mode];
+        return &modes[mode >= TIME_MODE_RAIN ? DESC_WEATHER + mode - TIME_MODE_RAIN : DESC_TIME + mode];
+    }
+    if (type == NODE_MESSAGE && message_choice(panel_settings) == CHOICE_SOUND) {
+        return &languages[language >= 0 ? language : LANGUAGE_ENGLISH].sound_description;
     }
     return &node_descriptions[type - NODE_FIRST];
 }
@@ -3726,6 +4217,7 @@ static void install(void)
     log_line("Sparkworks Enhanced " VERSION ", %s build %08lx", dedicated_server ? "dedicated server" : "game",
         nt->FileHeader.TimeDateStamp);
     read_settings();
+    init_sounds();  // the server sends sounds too (it has no editor that would set them up)
     uint8_t *code, *code_end, *data, *data_end;
     if (!section(image, nt, ".text", &code, &code_end) || !section(image, nt, ".rdata", &data, &data_end)) {
         log_line("sections not found, mod NOT active");
@@ -3817,9 +4309,11 @@ static void install(void)
     }
     if (!nodes_error && !patch_nodes()) nodes_error = "patching failed";
     if (!dedicated_server) patch_area_size(code, code_end);  // the server does not limit the size
+    int weather = install_weather(image, nt->OptionalHeader.SizeOfImage, data, data_end);
+    if (!weather) log_line("weather code not found: the weather modes stay off");
     if (nodes_error) log_line("nodes NOT active: %s", nodes_error);
-    else if (dedicated_server) log_line("nodes active on the server: Random Timer, Counter, Time, Random, Message (no editor)");
-    else log_line("nodes active: Random Timer, Counter, Time, Random, Message (logic editor category \"Sparkworks Enhanced\")");
+    else if (dedicated_server) log_line("nodes active on the server: Random Timer, Counter, Environment, Random, Alert (no editor)");
+    else log_line("nodes active: Random Timer, Counter, Environment, Random, Alert (logic editor category \"Sparkworks Enhanced\")");
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     random_state ^= (uint64_t)counter.QuadPart * 0x2545f4914f6cdd1dull;

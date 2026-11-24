@@ -7,8 +7,8 @@ How to install, the trigger area tags, settings, co-op and troubleshooting are e
 
 ## What it does
 
-- **5 new nodes** in their own logic editor category: Time, Random, Random Timer, Counter, Message.
-- **Smart trigger areas:** a tag in the area's name lets it count who is inside `(2)`, react only to some players `(@Name)` or everyone but them `(!Name)`, or watch chests `(Chest open)`, `(Chest 80%)`.
+- **5 new nodes** in their own logic editor category: Environment (time of day and weather), Random, Random Timer, Counter, Alert (center-screen messages and game sounds).
+- **Smart trigger areas:** a tag in the area's name lets it count who is inside `(2)`, react only to some players `(@Name)` or everyone but them `(!Name)`, only to villagers `(NPC)` or only to players `(!NPC)`, or watch chests `(Chest open)`, `(Chest 80%)`.
 - **Bigger trigger areas:** up to 16 m instead of 8 m (up to 64 m in the settings).
 - Solo, co-op and dedicated servers. English and German.
 
@@ -23,6 +23,8 @@ This mod goes deeper into the game than most, so here is what it changes.
 - **Edits from players without the mod:** they are ignored for the new nodes, so they cannot overwrite the settings.
 - **Trigger areas:** the mod reads the area's name and changes only the result of tagged areas. Untagged areas run unchanged.
 - **Messages:** sent as the game's own puzzle-completed event, which shows the "Door opened" / "Alarm" banners.
+- **Sounds:** sent as the game's own chest-deposit event with no chests in it, which makes every player's game play the chosen sound at the given object.
+- **Weather:** the game's own weather lookup (the one that makes players wet in the rain) is asked for the weather at the graph's first object.
 
 Every place the mod changes is found by a byte pattern and checked before patching. If the game code doesn't match (for example after a game update), the mod changes nothing and says so in its log (`debug.log`).
 
